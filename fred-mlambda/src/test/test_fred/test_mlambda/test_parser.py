@@ -136,3 +136,104 @@ class TestFromString:
         expr = "${math.factorial: 6}"
         parsed = MLambdaParser.from_string(expr)
         assert parsed.execute() == 720
+
+
+# ---------------------------------------------------------------------------
+# _extract_outer() and _serialize() — internal helpers
+# ---------------------------------------------------------------------------
+
+from fred.mlambda.parser import _extract_outer, _serialize
+
+
+class TestExtractOuter:
+    def test_flat_expression(self):
+        funref, param_line = _extract_outer("${math.factorial: 5}")
+        assert funref == "math.factorial"
+        assert param_line.strip() == "5"
+
+    def test_nested_expression_outer_only(self):
+        funref, param_line = _extract_outer("${count: ${RAND: alice, bob}}")
+        assert funref == "count"
+        assert "${RAND: alice, bob}" in param_line
+
+    def test_missing_colon_raises(self):
+        with pytest.raises(ValueError, match="Missing ':'"):
+            _extract_outer("${RAND}")
+
+    def test_unmatched_brace_raises(self):
+        with pytest.raises(ValueError, match="Unmatched"):
+            _extract_outer("${RAND: alice")
+
+    def test_trailing_chars_raises(self):
+        with pytest.raises(ValueError, match="Unexpected characters"):
+            _extract_outer("${RAND: alice} extra")
+
+    def test_invalid_funref_raises(self):
+        with pytest.raises(ValueError, match="Invalid function reference"):
+            _extract_outer("${123bad: x}")
+
+
+class TestSerialize:
+    def test_none(self):
+        assert _serialize(None) == "null"
+
+    def test_true(self):
+        assert _serialize(True) == "true"
+
+    def test_false(self):
+        assert _serialize(False) == "false"
+
+    def test_int(self):
+        assert _serialize(42) == "42"
+
+    def test_float(self):
+        assert _serialize(3.14) == "3.14"
+
+    def test_string(self):
+        assert _serialize("alice") == "alice"
+
+
+# ---------------------------------------------------------------------------
+# Nested expression integration tests
+# ---------------------------------------------------------------------------
+
+_POPULATION = ("alice", "bob", "carol")
+
+
+class TestNested:
+    def test_one_level_nested_execute(self):
+        # RAND picks one name; COUNT returns its length
+        expr = "${count: ${RAND: alice, bob, carol}}"
+        result = MLambdaParser.from_string(expr).execute()
+        assert isinstance(result, int)
+        assert result in {len(n) for n in _POPULATION}
+
+    def test_two_level_nested_execute(self):
+        # ${COUNT: ${STROPS: hello, upper}} -> COUNT("HELLO") -> 5
+        expr = "${count: ${STROPS: hello, upper}}"
+        result = MLambdaParser.from_string(expr).execute()
+        assert result == 5
+
+    def test_sibling_nested_args(self):
+        # ${STROPS: ${RAND: hello, world}, upper} -> "HELLO" or "WORLD"
+        expr = "${STROPS: ${RAND: hello, world}, upper}"
+        result = MLambdaParser.from_string(expr).execute()
+        assert result in ("HELLO", "WORLD")
+
+    def test_three_levels_deep(self):
+        # RAND -> "hi" or "hello" -> upper -> "HI" or "HELLO" -> count -> 2 or 5
+        expr = "${count: ${STROPS: ${RAND: hi, hello}, upper}}"
+        result = MLambdaParser.from_string(expr).execute()
+        assert result in (2, 5)
+
+    def test_nested_does_not_break_flat(self):
+        assert MLambdaParser.from_string("${count: hello}").execute() == 5
+        assert MLambdaParser.from_string("${math.factorial: 5}").execute() == 120
+
+    def test_resolve_nested_flat_passthrough(self):
+        flat = "alice, bob"
+        assert MLambdaParser._resolve_nested(flat) == flat
+
+    def test_resolve_nested_replaces_inner(self):
+        result = MLambdaParser._resolve_nested("${STROPS: hello, upper}")
+        assert result == "HELLO"
