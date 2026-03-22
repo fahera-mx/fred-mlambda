@@ -1,10 +1,5 @@
 from typing import Optional
 
-from fred.settings import logger_manager
-
-
-logger = logger_manager.get_logger(__name__)
-
 
 def strops(string: str, ops: str, fail: bool = False) -> Optional[str]:
     match ops:
@@ -26,5 +21,4 @@ def strops(string: str, ops: str, fail: bool = False) -> Optional[str]:
             msg = f"Unknown operation: {ops}"
             if fail:
                 raise ValueError(msg)
-            logger.warning(msg)
             return None
