@@ -7,12 +7,12 @@ from typing import Any, Callable, Union, Optional
 from fred.mlambda.interface import Arguments, MLambda
 from fred.mlambda.catalog import MLambdaCatalog
 
-# Matches: ${path.to.function: param_line}
-# Group 1 (dotpath):   "path.to.function"
-# Group 2 (param_line): "arg1,arg2,kwarg1=value1,..."
-_MLAMBDA_PATTERN = re.compile(
-    r"^\$\{\s*(?P<funref>[A-Za-z_][A-Za-z0-9_.]*)\s*:\s*(?P<param_line>[^}]*)\}$"
-)
+# Matches innermost ${...} — i.e. no $, {, or } inside the braces.
+# Used by _resolve_nested to find leaf-level expressions to evaluate first.
+_INNER_PATTERN = re.compile(r"\$\{[^${}]*\}")
+
+# Validates the funref portion: "path.to.function" or "ALIAS"
+_FUNREF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 # Supported type annotations via the "::" syntax, e.g. "42::int"
 MLAMBDA_TYPES = Optional[Union[int, float, bool, str]]
@@ -23,6 +23,85 @@ _TYPE_CASTERS: dict[str, Callable] = {
     "bool": lambda v: v.strip().lower() not in ("false", "0", "no", ""),
     "str": str,
 }
+
+
+def _serialize(value: Any) -> str:
+    """
+    Convert an execution result back into a string token that cast() can
+    handle — used when embedding a nested result into its parent param_line.
+
+    Examples:
+        None        -> "null"
+        True        -> "true"
+        False       -> "false"
+        42          -> "42"
+        3.14        -> "3.14"
+        "alice"     -> "alice"
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _extract_outer(string: str) -> tuple[str, str]:
+    """
+    Parse the outermost ${funref: param_line} shell using a brace-depth
+    counter so that nested '}' inside param_line are handled correctly.
+
+    Returns:
+        (funref, raw_param_line)
+
+    Raises:
+        ValueError: if the string is not a valid outer MLambda expression.
+    """
+    s = string.strip()
+
+    if not s.startswith("${"):
+        raise ValueError(
+            f"Invalid MLambda expression: {s!r}\n"
+            "Expected format: ${funref: arg1,arg2,kwarg=value,...}"
+        )
+
+    # Walk from position 1 (the '{') counting brace depth
+    depth = 0
+    closing = -1
+    for i in range(1, len(s)):
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                closing = i
+                break
+
+    if closing == -1:
+        raise ValueError(f"Unmatched '{{' in MLambda expression: {s!r}")
+    if closing != len(s) - 1:
+        raise ValueError(
+            f"Unexpected characters after closing '}}' in: {s!r}"
+        )
+
+    inner = s[2:closing]  # content between ${ and }
+
+    colon_idx = inner.find(":")
+    if colon_idx == -1:
+        raise ValueError(
+            f"Missing ':' separator in MLambda expression: {s!r}\n"
+            "Expected format: ${funref: param_line}"
+        )
+
+    funref = inner[:colon_idx].strip()
+    param_line = inner[colon_idx + 1:]
+
+    if not _FUNREF_RE.match(funref):
+        raise ValueError(
+            f"Invalid function reference {funref!r}. "
+            "Must be an identifier or dotted path (e.g. 'MY_ALIAS' or 'path.to.func')."
+        )
+
+    return funref, param_line
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +124,7 @@ class MLambdaParser:
         # Early exit for None values IF autoinfer is enabled
         if not disable_autoinfer and raw.lower() in ("null", "none", ""):
             return None
-        # Check for type annotation
+        # Check for explicit type annotation
         if "::" in raw:
             value_part, _, type_name = raw.rpartition("::")
             caster = _TYPE_CASTERS.get(type_name.strip())
@@ -99,37 +178,73 @@ class MLambdaParser:
         return args, kwargs
 
     @classmethod
+    def _resolve_nested(cls, param_line: str) -> str:
+        """
+        Resolve all nested ${...} expressions within a param_line string,
+        evaluating innermost expressions first and working outward.
+
+        For each iteration, _INNER_PATTERN finds expressions with no nested
+        braces (guaranteed to be fully flat), evaluates them via from_string,
+        and serializes the result back as a plain token string.  Repeats until
+        no ${...} remain.
+
+        Example:
+            "${RAND: alice, bob, carol}"
+            -> (evaluates RAND) -> "alice"
+
+            "${STROPS: ${RAND: hello, world}, upper}"
+            -> pass 1: "${RAND: hello, world}" -> "world"
+            -> param becomes "world, upper" (no more ${)
+            -> parse_line sees: args=["world"], kwargs={"upper": ...}
+            ... Wait: that's positional, so: args=["world", "upper"]
+        """
+        while "${" in param_line:
+            resolved = _INNER_PATTERN.sub(
+                lambda m: _serialize(cls.from_string(m.group(0)).execute()),
+                param_line,
+            )
+            if resolved == param_line:
+                # No substitution made — malformed inner expression
+                raise ValueError(
+                    f"Could not resolve nested MLambda expression in: {param_line!r}"
+                )
+            param_line = resolved
+        return param_line
+
+    @classmethod
     def from_string(cls, string: str) -> "MLambdaParser":
+        """
+        Parse a (potentially nested) MLambda expression string.
+
+        Supports expressions at arbitrary nesting depth, e.g.:
+            ${COUNT: ${RAND: alice, bob, carol}}
+            ${STROPS: ${RAND: hello, world}, upper}
+            ${A: ${B: ${C: x}}}
+        """
         payload = string.strip()
 
-        match = _MLAMBDA_PATTERN.match(payload)
-        if not match:
-            raise ValueError(
-                f"Invalid MLambda expression: {payload!r}\n"
-                "Expected format: ${path.to.function: arg1,arg2,kwarg1=value1,...}"
-            )
-        # Get the function reference and param_line from the match
-        funref: str = match.group("funref")
-        param_line: str = match.group("param_line")
-        # Parse the CSV-like parameter line
-        args, kwargs = cls.parse_line(param_line)
-        arguments = Arguments(
-            args=args,
-            kwargs=kwargs,
-        )
-        # If the function reference is an alias, get the MLambda from the catalog
+        # Step 1: extract the outer ${funref: raw_param_line} shell
+        # using a stack-based approach that correctly handles nested '}'
+        funref, raw_param_line = _extract_outer(payload)
+
+        # Step 2: resolve any nested ${...} within the param_line
+        resolved_param_line = cls._resolve_nested(raw_param_line)
+
+        # Step 3: parse the now-flat param_line
+        args, kwargs = cls.parse_line(resolved_param_line)
+        arguments = Arguments(args=args, kwargs=kwargs)
+
+        # Step 4: resolve the function reference
         if "." not in funref:
+            # Bare alias — look up in catalog / settings
             return cls(
                 mlambda=MLambdaCatalog.get_or_create(funref, fail=True),
                 arguments=arguments,
             )
-        # Split "path.to.function" -> import_pattern="path.to", fname="function"
+        # Dotted path — construct MLambda directly
         import_pattern, fname = funref.rsplit(".", 1)
         return cls(
-            mlambda=MLambda(
-                name=fname,
-                import_pattern=import_pattern
-            ),
+            mlambda=MLambda(name=fname, import_pattern=import_pattern),
             arguments=arguments,
         )
 
