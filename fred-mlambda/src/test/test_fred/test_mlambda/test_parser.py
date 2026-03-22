@@ -2,6 +2,7 @@ import pytest
 
 from fred.mlambda.parser import MLambdaParser
 from fred.mlambda.interface import Arguments, MLambda
+from fred.mlambda.parser import _extract_outer, _serialize
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +142,6 @@ class TestFromString:
 # ---------------------------------------------------------------------------
 # _extract_outer() and _serialize() — internal helpers
 # ---------------------------------------------------------------------------
-
-from fred.mlambda.parser import _extract_outer, _serialize
 
 
 class TestExtractOuter:
