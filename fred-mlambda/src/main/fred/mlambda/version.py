@@ -39,4 +39,8 @@ class Version:
             return cls(name=name, value=version_value)
 
 
-version = Version.from_path(name="fred.mlambda", dirpath=os.path.dirname(__file__))
+try:
+    version = Version.from_path(name="fred.mlambda", dirpath=os.path.dirname(__file__))
+except Exception:
+    print("Version file not found for package name: fred.mlambda, using 0.0.0")
+    version = Version(name="fred.mlambda", value="0.0.0")
